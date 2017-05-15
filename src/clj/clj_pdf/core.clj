@@ -41,7 +41,8 @@
      ZapfDingbatsList
      ZapfDingbatsNumberList]
     [cljpdf.text.pdf.draw DottedLineSeparator LineSeparator]
-    [cljpdf.text.pdf BaseFont MultiColumnText PdfContentByte PdfReader PdfStamper PdfWriter PdfPageEventHelper PdfPCell PdfPTable]))
+    [cljpdf.text.pdf BaseFont MultiColumnText PdfContentByte PdfReader PdfStamper PdfWriter PdfPageEventHelper PdfPCell PdfPTable PdfDocument]
+    (clojure.lang Atom)))
 
 (declare ^:dynamic *cache*)
 (def fonts-registered? (atom nil))
@@ -1009,6 +1010,56 @@
     )
   )
 
+(defn apply-page-numbering [pdf-writer doc pages page-events footer font-style page-numbers?]
+  (when-not pages
+    (doseq [page-event page-events]
+      (.setPageEvent pdf-writer page-event))
+    (if (or footer page-numbers?)
+      (.setFooter doc
+                  (doto (new HeaderFooter (new Phrase (str (:text footer) " ")
+                                               (font (merge font-style {:size 10 :color (:color footer)}))) page-numbers?)
+                    (.setBorder 0)
+                    (.setAlignment ^int (get-alignment (:align footer))))))))
+
+;; returns the number of pages in table-of-contents
+(defn add-table-of-contents [writer doc toc-data toc-total-pages]
+  (.newPage doc)
+  (let [total-pages-original (.reorderPages writer nil)]
+    (.add doc (Paragraph. "Table of Contents ---- Page (1)"))
+    (doseq [toc-item (reverse @toc-data)]
+      (.add doc
+            (Paragraph. (str (.getContent (:title toc-item)) " ----- Page (" (+ toc-total-pages (:page-number toc-item)) ")" ))))
+    (.newPage doc)
+    (let [total-pages-after (.reorderPages writer nil)
+          pages-list (range 1 (+ total-pages-after 1))
+          pages-list-original (take total-pages-original pages-list)
+          pages-list-toc (drop total-pages-original pages-list)
+          new-page-list (concat pages-list-toc pages-list-original)
+          ]
+      (.reorderPages writer (int-array new-page-list ))
+      (- total-pages-after total-pages-original)
+      )
+    ))
+
+
+(defn table-of-contents-generator! [meta toc-data]
+  "Accumulates Chapters and Sections data (title and page number) as the pdf is generated,"
+  "then generates and inserts table of contents page."
+  (proxy [PdfPageEventHelper] []
+    (onChapter [writer doc pos ^Paragraph title]
+      (do
+        (swap! toc-data conj {:title title :page-number (.getPageNumber writer)}
+          )
+        ))
+    (onSection [writer doc pos depth title]
+      (do
+        (swap! toc-data conj {:title title :page-number (.getPageNumber writer)}
+        )))
+    (onCloseDocument [writer doc]
+      ;(write-table-of-contents writer doc)
+    )
+  ))
+
 (defn- setup-doc [{:keys [left-margin
                           right-margin
                           top-margin
@@ -1027,7 +1078,8 @@
                           orientation
                           page-events
                           watermark
-                          background-color] :as meta}
+                          background-color
+                          table-of-contents] :as meta}
                   out]
 
   (let [[nom head] doc-header
@@ -1065,15 +1117,10 @@
                                                        :page-width width
                                                        :page-height height))))
 
-      (when-not pages
-        (doseq [page-event page-events]
-          (.setPageEvent pdf-writer page-event))
-        (if (or footer page-numbers?)
-          (.setFooter doc
-                      (doto (new HeaderFooter (new Phrase (str (:text footer) " ")
-                                                   (font (merge font-style {:size 10 :color (:color footer)}))) page-numbers?)
-                        (.setBorder 0)
-                        (.setAlignment ^int (get-alignment (:align footer)))))))
+      ;; apply page numbering in the normal case
+      ;; if there is a table-of-contents, this must be deferred until after it is generated and inserted
+      (if-not table-of-contents
+        (apply-page-numbering pdf-writer doc pages page-events footer font-style page-numbers?))
 
       ;;must set margins before opening the doc
       (if (and left-margin right-margin top-margin bottom-margin)
@@ -1117,7 +1164,7 @@
         :left (+ 50 font-width)
         :center (- (/ page-width 2) (/ font-width 2))))))
 
-(defn- write-total-pages [width {:keys [total-pages footer font-style]} ^ByteArrayOutputStream temp-stream ^OutputStream output-stream]
+(defn- write-total-pages [width {:keys [total-pages footer font-style table-of-contents]} ^ByteArrayOutputStream temp-stream ^OutputStream output-stream]
   (when (or total-pages (:table footer))
     (let [reader    (new PdfReader (.toByteArray temp-stream))
           stamper   (new PdfStamper reader output-stream)
@@ -1178,7 +1225,7 @@
   "(write-doc document out)
   document consists of a vector containing a map which defines the document metadata and the contents of the document
   out can either be a string which will be treated as a filename or an output stream"
-  [[doc-meta & content] out]
+  [[doc-meta & content] out toc-total-pages]
   (let [doc-meta (-> doc-meta
                      parse-meta
                      (assoc :total-pages (:pages doc-meta))
@@ -1187,14 +1234,27 @@
          width height
          ^ByteArrayOutputStream temp-stream
          ^OutputStream output-stream
-         ^PdfWriter pdf-writer] (setup-doc doc-meta out)]
+         ^PdfWriter pdf-writer] (setup-doc doc-meta out)
+        ;; used to store chapter and section data as Pdf is written, for use in table of contents
+        table-of-contents? (:table-of-contents doc-meta)
+        toc-data (atom())]
+
+    (if table-of-contents?
+      (do (.setLinearPageMode pdf-writer)
+          (.setPageEvent pdf-writer (table-of-contents-generator! meta toc-data))))
+
     (doseq [item content]
       (add-item item doc-meta width height doc pdf-writer))
-    (.close doc)
-    (when (and (not (:pages doc-meta))
-               (not (empty? (:page-events doc-meta))))
-      (write-pages temp-stream output-stream))
-    (write-total-pages width doc-meta temp-stream output-stream)))
+
+    (let [toc-total-pages (if toc-total-pages (add-table-of-contents pdf-writer doc toc-data toc-total-pages) nil)]
+
+      (.close doc)
+      (when (and (not (:pages doc-meta))
+                 (not (empty? (:page-events doc-meta))))
+        (write-pages temp-stream output-stream))
+      (write-total-pages width doc-meta temp-stream output-stream)
+
+      toc-total-pages)))
 
 (defn- to-pdf [input-reader r out]
   (let [doc-meta (-> r input-reader parse-meta)
@@ -1235,14 +1295,14 @@
 
 (defn pdf
   "usage:
-   in can be either a vector containing the document or an input stream. If in is an input stream then the forms will be read sequentially from it.
+   in can be either a vector containing the document or an input stream. If it is an input stream then the forms will be read sequentially from it.
    out can be either a string, in which case it's treated as a file name, or an output stream.
    NOTE: using the :pages option will cause the complete document to reside in memory as it will need to be post processed."
   [in out]
   (binding [*cache* (atom {})]
     (cond (instance? InputStream in) (stream-doc in out)
           (seq? in) (seq-to-doc in out)
-          :else (write-doc in out))))
+          :else (write-doc in out (write-doc in out 1)))))
 
 (defn collate
   "usage: takes an output that can be a file name or an output stream followed by one or more documents
