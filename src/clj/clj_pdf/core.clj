@@ -40,12 +40,14 @@
      Table
      ZapfDingbatsList
      ZapfDingbatsNumberList]
-    [cljpdf.text.pdf.draw DottedLineSeparator LineSeparator]
-    [cljpdf.text.pdf BaseFont MultiColumnText PdfContentByte PdfReader PdfStamper PdfWriter PdfPageEventHelper PdfPCell PdfPTable PdfDocument]
+    [cljpdf.text.pdf.draw DottedLineSeparator LineSeparator VerticalPositionMark]
+    [cljpdf.text.pdf BaseFont MultiColumnText PdfContentByte PdfReader PdfStamper PdfWriter PdfPageEventHelper PdfPCell PdfPTable PdfDocument PdfTemplate]
     (clojure.lang Atom)))
 
 (declare ^:dynamic *cache*)
 (def fonts-registered? (atom nil))
+(def toc-data (atom ()))
+(def toc-templates (atom ()))
 
 (declare make-section)
 
@@ -852,7 +854,7 @@
 (defn- clear-double-page [stylesheet references font-style width height item doc ^PdfWriter pdf-writer]
   "End current page and make sure that subsequent content will start on
      the next odd-numbered page, inserting a blank page if necessary."
-  (let [append (fn [item] (append-to-doc stylesheet references font-style width height item doc pdf-writer))]
+  (let [append (fn [item] (append-to-doc stylesheet references font-style width height item doc pdf-writer nil))]
     ;; Inserting a :pagebreak starts a new page, unless we already happen to
     ;; be on a blank page, in which case it does nothing;
     (append [:pagebreak])
@@ -863,10 +865,73 @@
       (append [:paragraph " "])
       (append [:pagebreak]))))
 
-(defn- append-to-doc [stylesheet references font-style width height item ^Document doc ^PdfWriter pdf-writer]
+;; returns the first string in a nested vector, depth-first
+(defn get-first-string [v]
+  (let [element (first v)]
+    (cond
+      (string? element) element
+      (vector? element) (or (get-first-string element) (get-first-string (rest v)))
+      :else (if (= 1 (count v)) nil (get-first-string (rest v)))
+      )
+    )
+  )
+
+(defn vertical-mark-template [^PdfTemplate template]
+  (proxy [VerticalPositionMark] []
+      (draw [^PdfContentByte canvas llx lly urx ury y]
+        (do
+          (.addTemplate canvas template (- urx 50) y)
+          (println "template " urx " " y)
+          )
+            )
+    )
+  )
+
+(defn add-table-of-contents [writer doc full-document-content]
+  (let [
+        ^PdfContentByte canvas (.getDirectContentUnder writer)
+        ]
+    (.add doc (Paragraph. "Table of Contents"))
+    (doseq [item full-document-content]
+      (when (= :chapter (first item))
+        (let [template (.createTemplate canvas 50 50)]
+          (println (str "chapter: "  (get-first-string item)))
+          (.add doc (Paragraph. "Chapter"))
+          (.add doc (vertical-mark-template template))
+          (swap! toc-templates conj template)
+          (doseq [item (filter vector? item)]
+            (when (= :section (first item))
+              ;(println (str "section: " (get-first-string item)))
+              ;(.add doc (Paragraph. "Section"))
+              )
+            )
+          )
+        )
+      )
+
+  ))
+
+(defn finish-table-of-contents [writer]
+  (let []
+    (println "entered here, toc-data:" (count @toc-data) " toc-templates:" (count @toc-templates))
+    (doseq [template @toc-templates]
+      (.beginText template)
+      (.setFontAndSize template (BaseFont/createFont) 12)
+      (.setTextMatrix template 50 0)
+      (.showText template (String/valueOf "TEST"))
+      (.endText template)
+      (println "filled template")
+      )
+
+  ))
+
+
+
+(defn- append-to-doc [stylesheet references font-style width height item ^Document doc ^PdfWriter pdf-writer content]
   (cond
     (= [:pagebreak] item) (.newPage doc)
     (= [:clear-double-page] item) (clear-double-page stylesheet references font-style width height item doc pdf-writer)
+    (= [:table-of-contents] item) (add-table-of-contents pdf-writer doc content)
     :else (.add doc
                 (make-section
                   (assoc font-style
@@ -1021,28 +1086,9 @@
                     (.setBorder 0)
                     (.setAlignment ^int (get-alignment (:align footer))))))))
 
-;; returns the number of pages in table-of-contents
-(defn add-table-of-contents [writer doc toc-data toc-total-pages]
-  (.newPage doc)
-  (let [total-pages-original (.reorderPages writer nil)]
-    (.add doc (Paragraph. "Table of Contents ---- Page (1)"))
-    (doseq [toc-item (reverse @toc-data)]
-      (.add doc
-            (Paragraph. (str (.getContent (:title toc-item)) " ----- Page (" (+ toc-total-pages (:page-number toc-item)) ")" ))))
-    (.newPage doc)
-    (let [total-pages-after (.reorderPages writer nil)
-          pages-list (range 1 (+ total-pages-after 1))
-          pages-list-original (take total-pages-original pages-list)
-          pages-list-toc (drop total-pages-original pages-list)
-          new-page-list (concat pages-list-toc pages-list-original)
-          ]
-      (.reorderPages writer (int-array new-page-list ))
-      (- total-pages-after total-pages-original)
-      )
-    ))
 
 
-(defn table-of-contents-generator! [meta toc-data]
+(defn table-of-contents-populator! [meta toc-data]
   "Accumulates Chapters and Sections data (title and page number) as the pdf is generated,"
   "then generates and inserts table of contents page."
   (proxy [PdfPageEventHelper] []
@@ -1056,7 +1102,6 @@
         (swap! toc-data conj {:title title :page-number (.getPageNumber writer)}
         )))
     (onCloseDocument [writer doc]
-      ;(write-table-of-contents writer doc)
     )
   ))
 
@@ -1079,7 +1124,7 @@
                           page-events
                           watermark
                           background-color
-                          table-of-contents] :as meta}
+                          table-of-contents?] :as meta}
                   out]
 
   (let [[nom head] doc-header
@@ -1117,10 +1162,11 @@
                                                        :page-width width
                                                        :page-height height))))
 
-      ;; apply page numbering in the normal case
-      ;; if there is a table-of-contents, this must be deferred until after it is generated and inserted
-      (if-not table-of-contents
-        (apply-page-numbering pdf-writer doc pages page-events footer font-style page-numbers?))
+      ;; insert table of contents with placeholders for section page numbers
+      (if table-of-contents?
+        (.setPageEvent pdf-writer (table-of-contents-populator! meta toc-data)))
+
+      (apply-page-numbering pdf-writer doc pages page-events footer font-style page-numbers?)
 
       ;;must set margins before opening the doc
       (if (and left-margin right-margin top-margin bottom-margin)
@@ -1203,11 +1249,11 @@
 
     :else item))
 
-(defn- add-item [item {:keys [stylesheet font references]} width height ^Document doc ^PdfWriter pdf-writer]
+(defn- add-item [item {:keys [stylesheet font references]} width height ^Document doc ^PdfWriter pdf-writer content]
   (if (and (coll? item) (coll? (first item)))
     (doseq [element item]
-      (append-to-doc stylesheet references font width height (preprocess-item element) doc pdf-writer))
-    (append-to-doc stylesheet references font width height (preprocess-item item) doc pdf-writer)))
+      (append-to-doc stylesheet references font width height (preprocess-item element) doc pdf-writer content))
+    (append-to-doc stylesheet references font width height (preprocess-item item) doc pdf-writer content)))
 
 (defn- register-fonts [doc-meta]
   (when (and (= true (:register-system-fonts? doc-meta))
@@ -1221,40 +1267,30 @@
   ; font would conflict with a function definition
   (assoc doc-meta :font-style (:font doc-meta)))
 
+
 (defn- write-doc
   "(write-doc document out)
   document consists of a vector containing a map which defines the document metadata and the contents of the document
   out can either be a string which will be treated as a filename or an output stream"
-  [[doc-meta & content] out toc-total-pages]
+  [[doc-meta & content] out]
   (let [doc-meta (-> doc-meta
                      parse-meta
                      (assoc :total-pages (:pages doc-meta))
-                     (assoc :pages (boolean (or (:pages doc-meta) (-> doc-meta :footer :table)))))
+                     (assoc :pages (boolean (or (:pages doc-meta) (-> doc-meta :footer :table))))
+                     (assoc :table-of-contents?  true)) ;; todo fix
         [^Document doc
          width height
          ^ByteArrayOutputStream temp-stream
          ^OutputStream output-stream
-         ^PdfWriter pdf-writer] (setup-doc doc-meta out)
-        ;; used to store chapter and section data as Pdf is written, for use in table of contents
-        table-of-contents? (:table-of-contents doc-meta)
-        toc-data (atom())]
-
-    (if table-of-contents?
-      (do (.setLinearPageMode pdf-writer)
-          (.setPageEvent pdf-writer (table-of-contents-generator! meta toc-data))))
-
+         ^PdfWriter pdf-writer] (setup-doc doc-meta out)]
     (doseq [item content]
-      (add-item item doc-meta width height doc pdf-writer))
-
-    (let [toc-total-pages (if toc-total-pages (add-table-of-contents pdf-writer doc toc-data toc-total-pages) nil)]
-
-      (.close doc)
-      (when (and (not (:pages doc-meta))
-                 (not (empty? (:page-events doc-meta))))
-        (write-pages temp-stream output-stream))
-      (write-total-pages width doc-meta temp-stream output-stream)
-
-      toc-total-pages)))
+      (add-item item doc-meta width height doc pdf-writer content))
+    (finish-table-of-contents  pdf-writer)
+    (.close doc)
+    (when (and (not (:pages doc-meta))
+               (not (empty? (:page-events doc-meta))))
+      (write-pages temp-stream output-stream))
+    (write-total-pages width doc-meta temp-stream output-stream)))
 
 (defn- to-pdf [input-reader r out]
   (let [doc-meta (-> r input-reader parse-meta)
@@ -1302,7 +1338,7 @@
   (binding [*cache* (atom {})]
     (cond (instance? InputStream in) (stream-doc in out)
           (seq? in) (seq-to-doc in out)
-          :else (write-doc in out (write-doc in out 1)))))
+          :else (write-doc in out))))
 
 (defn collate
   "usage: takes an output that can be a file name or an output stream followed by one or more documents
